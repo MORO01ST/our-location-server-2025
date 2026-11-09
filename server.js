@@ -1,47 +1,78 @@
+require('dotenv').config();
+
 const express = require('express');
-const Database = require('better-sqlite3');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const db = require('./src/db');
+const authRoutes = require('./src/routes/auth');
+const familyRoutes = require('./src/routes/family');
+const locationRoutes = require('./src/routes/location');
+const { requireAuth } = require('./src/middleware/auth');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || "change-me";
+const PORT = Number(process.env.PORT || 3000);
+const jwtSecret = process.env.JWT_SECRET || '';
 
-app.use(cors());
-app.use(express.json());
-
-const db = new Database('database.db');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS devices (
-    device_id TEXT PRIMARY KEY,
-    name TEXT, lat REAL, lng REAL,
-    accuracy REAL, battery INTEGER, timestamp INTEGER
-  )
-`);
-
-function auth(req, res, next) {
-  if (req.headers['x-api-key'] !== API_KEY)
-    return res.status(401).json({ error: 'Unauthorized' });
-  next();
+if (process.env.NODE_ENV === 'production' && jwtSecret.length < 32) {
+  throw new Error('JWT_SECRET must be set to a random secret of at least 32 characters in production.');
+}
+if (!jwtSecret) {
+  console.warn('WARNING: JWT_SECRET is not set. Set it in .env before using this server.');
 }
 
-app.post('/api/location', auth, (req, res) => {
-  const { device_id, name, lat, lng, accuracy, battery } = req.body;
-  if (!device_id || lat == null || lng == null)
-    return res.status(400).json({ error: 'Missing fields' });
+const origins = (process.env.CORS_ORIGINS || '*').split(',').map(x => x.trim());
+app.disable('x-powered-by');
+app.use(helmet());
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || origins.includes('*') || origins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origin not allowed by CORS'));
+  }
+}));
+app.use(express.json({ limit: '20kb' }));
 
-  db.prepare(`
-    INSERT INTO devices (device_id, name, lat, lng, accuracy, battery, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(device_id) DO UPDATE SET
-      name=excluded.name, lat=excluded.lat, lng=excluded.lng,
-      accuracy=excluded.accuracy, battery=excluded.battery, timestamp=excluded.timestamp
-  `).run(device_id, name || 'Unknown', lat, lng, accuracy || 0, battery || -1, Date.now());
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false
+});
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Try again later.' }
+});
+app.use(generalLimiter);
 
-  res.json({ status: 'ok' });
+app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'Family Track API', version: '2.0.0' }));
+app.use('/api/auth', authLimiter, authRoutes);
+app.use('/api/family', requireAuth, familyRoutes);
+app.use('/api/location', requireAuth, locationRoutes);
+
+app.use((_req, res) => res.status(404).json({ error: 'Route not found' }));
+app.use((err, _req, res, _next) => {
+  if (err && err.message === 'Origin not allowed by CORS') {
+    return res.status(403).json({ error: 'Origin not allowed' });
+  }
+  console.error(err);
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-app.get('/api/locations', auth, (req, res) => {
-  res.json(db.prepare('SELECT * FROM devices').all());
+const server = app.listen(PORT, () => {
+  console.log(`Family Track API v2.0 running on port ${PORT}`);
 });
 
-app.listen(PORT, () => console.log('Server on port ' + PORT));
+function shutdown() {
+  server.close(() => {
+    db.close();
+    process.exit(0);
+  });
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
